@@ -1,21 +1,41 @@
 # bot_app.py
 import os
 import time
-import threading
 import sqlite3
-import requests
-from flask import Flask, request, jsonify
+import logging
+from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- Konfigurasi via ENV ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN")           # dari BotFather
-XENDIT_API_KEY = os.environ.get("XENDIT_API_KEY") # secret key Xendit
-ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))  # chat id grup konselor
-PORT = int(os.environ.get("PORT", "5000"))
+# ---------- Konfigurasi (ubah teks di sini bila perlu) ----------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # isi dari BotFather
+KONSELOR_CHAT_ID = int(os.environ.get("KONSELOR_CHAT_ID", "0"))  # chat id grup/akun konselor (angka)
 
-# --- Database sederhana (SQLite) ---
-DB = "bot.db"
+# Teks yang mudah diubah — edit saja string di bawah jika ingin ubah pesan default
+TEXT_START = (
+    "Halo 👋\n"
+    "Ini adalah bot curhat anonim.\n\n"
+    "Ketik pesan kapan saja. Jika dalam jam kerja (12:00–17:00), "
+    "pesanmu akan diteruskan ke konselor. Di luar jam kerja, kamu akan mendapat pesan bahwa konselor tutup."
+)
+TEXT_OFFLINE = (
+    "Terima kasih sudah curhat 🙏\n\n"
+    "Saat ini konselor sedang *tutup*.\n"
+    "Jam kerja konselor: 12:00–17:00.\n\n"
+    "Tinggalkan pesan — nanti akan dibaca saat jam kerja."
+)
+TEXT_FORWARD_CONFIRM = "Pesanmu sudah dikirim ke konselor ✅"
+TEXT_PHOTO_CONFIRM = "Foto sudah diteruskan ke konselor ✅"
+TEXT_KONSELOR_PREFIX = "Konselor: "  # prefix saat konselor membalas
+
+# Jam kerja (local server time). Ubah angka jika mau jam lain.
+WORK_START_HOUR = 12  # inclusive (12:00)
+WORK_END_HOUR = 17    # exclusive (17:00 => sampai 16:59)
+
+# ---------- Setup ----------
+logging.basicConfig(level=logging.INFO)
+DB = "curhat.db"
+
 def init_db():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -24,17 +44,11 @@ def init_db():
                    telegram_id INTEGER UNIQUE,
                    created_at INTEGER
                  )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+    c.execute('''CREATE TABLE IF NOT EXISTS messages (
                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                    client_id INTEGER,
-                   reference_id TEXT,
-                   active INTEGER,
-                   expires_at INTEGER
-                 )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS curhats (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   client_id INTEGER,
-                   text TEXT,
+                   type TEXT,
+                   content TEXT,
                    ts INTEGER
                  )''')
     conn.commit()
@@ -48,122 +62,86 @@ def get_or_create_client(telegram_id):
     if row:
         cid = row[0]
     else:
-        c.execute("INSERT INTO clients (telegram_id, created_at) VALUES (?, ?)", (telegram_id, int(time.time())))
+        c.execute("INSERT INTO clients (telegram_id, created_at) VALUES (?, ?)",
+                  (telegram_id, int(time.time())))
         cid = c.lastrowid
         conn.commit()
     conn.close()
     return cid
 
-def create_session(client_id, reference_id, duration_seconds=3600):
-    expires = int(time.time()) + duration_seconds
+def save_message(client_id, typ, content):
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute("UPDATE sessions SET active=0 WHERE client_id=?", (client_id,))
-    c.execute("INSERT INTO sessions (client_id, reference_id, active, expires_at) VALUES (?, ?, ?, ?)",
-              (client_id, reference_id, 1, expires))
+    c.execute("INSERT INTO messages (client_id, type, content, ts) VALUES (?, ?, ?, ?)",
+              (client_id, typ, content, int(time.time())))
     conn.commit()
     conn.close()
 
-def end_session_by_client(client_id):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("UPDATE sessions SET active=0 WHERE client_id=?", (client_id,))
-    conn.commit()
-    conn.close()
+def is_working_hours():
+    now = datetime.now()
+    h = now.hour
+    return WORK_START_HOUR <= h < WORK_END_HOUR
 
-def is_session_active(client_id):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    now = int(time.time())
-    c.execute("SELECT id, expires_at FROM sessions WHERE client_id=? AND active=1", (client_id,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return False
-    _, expires_at = row
-    if expires_at < now:
-        end_session_by_client(client_id)
-        return False
-    return True
-
-# --- Telegram handlers ---
+# ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Halo! Saya bot curhat anonim 🤖\n\n"
-        "Kirim pesan apapun untuk curhat GRATIS (pesanmu akan diteruskan ke konselor).\n"
-        "Jika ingin sesi pribadi 1 jam (Rp15.000), ketik /book."
-    )
+    await update.message.reply_text(TEXT_START)
 
-async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_user = update.effective_user
-    client_id = get_or_create_client(tg_user.id)
-    amount = 15000
-    reference_id = f"session_{client_id}_{int(time.time())}"
-    payload = {
-        "amount": amount,
-        "currency": "IDR",
-        "description": "Sesi Konseling 1 jam (anonim)",
-        "reference_id": reference_id
-    }
-    resp = requests.post(
-        "https://api.xendit.co/v2/payment_links",
-        auth=(XENDIT_API_KEY, ''),
-        json=payload
-    )
-    if resp.status_code in (200, 201):
-        data = resp.json()
-        url = data.get("url") or data.get("checkout_url") or data.get("invoice_url")
-        if url:
-            await update.message.reply_text(
-                f"Silakan bayar Rp{amount:,} di link ini:\n{url}\n"
-                "Setelah bayar, sesi 1 jam akan aktif otomatis."
-            )
-            conn = sqlite3.connect(DB)
-            c = conn.cursor()
-            c.execute("INSERT INTO sessions (client_id, reference_id, active, expires_at) VALUES (?, ?, ?, ?)",
-                      (client_id, reference_id, 0, 0))
-            conn.commit()
-            conn.close()
-        else:
-            await update.message.reply_text("Gagal membuat link pembayaran.")
-    else:
-        await update.message.reply_text("Gagal membuat link pembayaran. Coba lagi nanti.")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # only private chats allowed
     if update.effective_chat.type != "private":
         return
+
     user = update.effective_user
     text = update.message.text or ""
     client_id = get_or_create_client(user.id)
+    save_message(client_id, "text_from_user", text)
 
-    if is_session_active(client_id):
-        label = f"Klien #{client_id} (SESI AKTIF)"
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"{label}:\n{text}")
-        await update.message.reply_text("Pesan terkirim ke konselor.")
+    if is_working_hours():
+        label = f"Klien #{client_id} (anonim)"
+        # kirim ke konselor (group/account)
+        await context.bot.send_message(chat_id=KONSELOR_CHAT_ID, text=f"{label}:\n{text}")
+        await update.message.reply_text(TEXT_FORWARD_CONFIRM)
+    else:
+        await update.message.reply_text(TEXT_OFFLINE)
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # handle photos sent by user (private chat)
+    if update.effective_chat.type != "private":
         return
 
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("INSERT INTO curhats (client_id, text, ts) VALUES (?, ?, ?)", (client_id, text, int(time.time())))
-    conn.commit()
-    conn.close()
+    user = update.effective_user
+    client_id = get_or_create_client(user.id)
 
-    await update.message.reply_text(
-        "Terima kasih sudah berbagi 🙏 Pesanmu diteruskan ke konselor.\n"
-        "Jika ingin sesi pribadi 1 jam, ketik /book."
-    )
-    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"NEW CURHAT — Klien #{client_id}:\n{text}")
+    # get largest photo file_id
+    photo_list = update.message.photo or []
+    if not photo_list:
+        await update.message.reply_text("Tidak ada foto yang terdeteksi.")
+        return
+    file_id = photo_list[-1].file_id
+    save_message(client_id, "photo_file_id", file_id)
 
-# Konselor reply: /reply <client_id> <pesan>
+    if is_working_hours():
+        label = f"Klien #{client_id} (anonim) — foto"
+        # kirim photo ke konselor group (bot akan mengirim foto berdasarkan file_id)
+        await context.bot.send_photo(chat_id=KONSELOR_CHAT_ID, photo=file_id, caption=label)
+        await update.message.reply_text(TEXT_PHOTO_CONFIRM)
+    else:
+        await update.message.reply_text(TEXT_OFFLINE)
+
+# Konselor reply text: /reply <client_id> <pesan>
 async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_CHAT_ID:
+    if update.effective_chat.id != KONSELOR_CHAT_ID:
         return
-    args = context.args
-    if len(args) < 2:
+    if len(context.args) < 2:
         await update.message.reply_text("Usage: /reply <client_id> <pesan>")
         return
-    client_id = int(args[0])
-    pesan = " ".join(args[1:])
+    try:
+        client_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Client_id harus berupa angka.")
+        return
+    pesan = " ".join(context.args[1:])
+
     conn = sqlite3.connect(DB)
     c = conn.cursor()
     c.execute("SELECT telegram_id FROM clients WHERE id=?", (client_id,))
@@ -173,55 +151,75 @@ async def reply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Client ID tidak ditemukan.")
         return
     tg_id = row[0]
-    await context.bot.send_message(chat_id=tg_id, text=f"Konselor: {pesan}")
-    await update.message.reply_text("Terkirim ke klien.")
+    await context.bot.send_message(chat_id=tg_id, text=f"{TEXT_KONSELOR_PREFIX}{pesan}")
+    save_message(client_id, "text_from_konselor", pesan)
+    await update.message.reply_text("Balasan dikirim ke klien ✅")
 
-async def end_session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_CHAT_ID:
+# Konselor kirim foto ke klien:
+# two modes:
+# 1) reply to a photo message in group with: /sendphoto <client_id>
+#    (bot akan mengambil photo dari pesan yang dikomentari)
+# 2) /sendphoto <client_id> <image_url>
+async def sendphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != KONSELOR_CHAT_ID:
         return
     if len(context.args) < 1:
-        await update.message.reply_text("Usage: /endsession <client_id>")
+        await update.message.reply_text(
+            "Usage:\n"
+            "1) Reply ke foto di grup konselor dengan perintah: /sendphoto <client_id>\n"
+            "2) /sendphoto <client_id> <image_url>"
+        )
         return
-    client_id = int(context.args[0])
-    end_session_by_client(client_id)
-    await update.message.reply_text(f"Sesi Klien #{client_id} diakhiri.")
+    try:
+        client_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Client_id harus angka.")
+        return
 
-# --- Flask app untuk webhook ---
-flask_app = Flask(__name__)
+    # get target user telegram_id
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT telegram_id FROM clients WHERE id=?", (client_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        await update.message.reply_text("Client ID tidak ditemukan.")
+        return
+    tg_id = row[0]
 
-@flask_app.route("/xendit_webhook", methods=["POST"])
-def xendit_webhook():
-    data = request.json or {}
-    reference = data.get("reference_id") or data.get("external_id")
-    status = data.get("status")
-    if reference and status and status.lower() in ("paid", "completed", "success"):
-        conn = sqlite3.connect(DB)
-        c = conn.cursor()
-        c.execute("SELECT client_id FROM sessions WHERE reference_id=?", (reference,))
-        row = c.fetchone()
-        conn.close()
-        if row:
-            client_id = row[0]
-            create_session(client_id, reference, duration_seconds=3600)
-            from telegram import Bot
-            bot = Bot(token=BOT_TOKEN)
-            bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"Sesi aktif: Klien #{client_id} — 1 jam dimulai.")
-    return jsonify({"ok": True})
+    # Mode 1: reply to a photo message
+    if update.message.reply_to_message and update.message.reply_to_message.photo:
+        file_id = update.message.reply_to_message.photo[-1].file_id
+        await context.bot.send_photo(chat_id=tg_id, photo=file_id, caption=TEXT_KONSELOR_PREFIX + "(gambar dari konselor)")
+        save_message(client_id, "photo_from_konselor_fileid", file_id)
+        await update.message.reply_text("Foto dikirim ke klien ✅")
+        return
 
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT)
+    # Mode 2: send photo from URL (argument ke-2)
+    if len(context.args) >= 2:
+        url = context.args[1]
+        try:
+            await context.bot.send_photo(chat_id=tg_id, photo=url, caption=TEXT_KONSELOR_PREFIX + "(gambar dari konselor)")
+            save_message(client_id, "photo_from_konselor_url", url)
+            await update.message.reply_text("Foto dari URL dikirim ke klien ✅")
+        except Exception as e:
+            await update.message.reply_text(f"Gagal mengirim foto dari URL: {e}")
+        return
 
+    await update.message.reply_text("Tidak ada foto atau URL ditemukan. Lihat petunjuk usage.")
+
+# ---------- Main ----------
 def main():
     init_db()
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
-
     application = ApplicationBuilder().token(BOT_TOKEN).build()
+
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("book", book))
     application.add_handler(CommandHandler("reply", reply_cmd))
-    application.add_handler(CommandHandler("endsession", end_session_cmd))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    application.add_handler(CommandHandler("sendphoto", sendphoto_cmd))
+    application.add_handler(MessageHandler(filters.PHOTO & (~filters.COMMAND), handle_photo))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+
+    logging.info("Bot started. Listening for messages...")
     application.run_polling()
 
 if __name__ == "__main__":
